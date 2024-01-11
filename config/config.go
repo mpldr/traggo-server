@@ -9,6 +9,7 @@ import (
 	"github.com/kelseyhightower/envconfig"
 	"github.com/rs/zerolog"
 	"github.com/traggo/server/config/mode"
+	"mpldr.codes/oidc"
 )
 
 var (
@@ -28,6 +29,10 @@ type Config struct {
 	PassStrength       int      `default:"10" split_words:"true"`
 	DatabaseDialect    string   `default:"sqlite3" split_words:"true"`
 	DatabaseConnection string   `default:"data/traggo.db" split_words:"true"`
+	OIDCWellKnown      string   `envconfig:"oidc_wellknown"`
+	OIDCClientID       string   `envconfig:"oidc_client_id"`
+	OIDCClientSecret   string   `envconfig:"oidc_client_secret"`
+	oidcConfig         *oidc.Configuration
 }
 
 // Get loads the application config.
@@ -67,7 +72,26 @@ func Get() (Config, []FutureLog) {
 			Msg:   fmt.Sprintf("cannot parse env params: %s", err)})
 	}
 
+	if config.OIDCWellKnown != "" &&
+		config.OIDCClientID != "" &&
+		config.OIDCClientSecret != "" {
+		cfg, err := oidc.Configure(config.OIDCWellKnown, "")
+		if err != nil {
+			logs = append(logs, FutureLog{
+				Level: zerolog.FatalLevel,
+				Msg:   fmt.Sprintf("oidc initialisation failed: %s", err),
+			})
+		} else {
+			cfg.SetCredentials(config.OIDCClientID, config.OIDCClientSecret)
+			config.oidcConfig = cfg
+		}
+	}
+
 	return config, logs
+}
+
+func (c *Config) OIDCConfig() *oidc.Configuration {
+	return c.oidcConfig
 }
 
 func getExecutableOrWorkDir() (string, *FutureLog) {

@@ -73,7 +73,7 @@ func initRouter(db *gorm.DB, conf config.Config, version model.Version) *mux.Rou
 		graphql.NewDirective())
 
 	router := mux.NewRouter()
-	router.Use(auth.Middleware(db))
+	router.Use(auth.Middleware(db, conf.OIDCConfig()))
 	router.HandleFunc("/graphql", gqlHandler)
 	ui.Register(router, box)
 	return router

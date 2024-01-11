@@ -3,7 +3,9 @@ package auth
 import (
 	"context"
 	"errors"
+	"hash/crc64"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -12,6 +14,7 @@ import (
 	"github.com/jinzhu/gorm"
 	"github.com/rs/zerolog/log"
 	"github.com/traggo/server/model"
+	"mpldr.codes/oidc"
 )
 
 type key string
@@ -22,11 +25,17 @@ var (
 	destroySessionKey key = "destroySession"
 	userKey           key = "user"
 	deviceKey         key = "device"
+	oidcTokens            = make(map[string]*oidc.Token)
 )
 
 // Middleware is the auth middleware which sets user and device context parameters.
-func Middleware(db *gorm.DB) mux.MiddlewareFunc {
+func Middleware(db *gorm.DB, oidcCfg *oidc.Configuration) mux.MiddlewareFunc {
 	return func(handler http.Handler) http.Handler {
+		if oidcCfg != nil {
+			return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				handler.ServeHTTP(writer, sessionCallbacks(reqisterOIDCUser(request, writer, oidcCfg, db), writer))
+			})
+		}
 		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 			handler.ServeHTTP(writer, sessionCallbacks(reqisterUser(request, writer, db), writer))
 		})
@@ -49,6 +58,74 @@ func sessionCallbacks(request *http.Request, writer http.ResponseWriter) *http.R
 		})
 	}
 	return request.WithContext(WithDestroySession(WithCreateSession(request.Context(), createSession), destroySession))
+}
+
+func reqisterOIDCUser(
+	request *http.Request,
+	writer http.ResponseWriter,
+	oidcCfg *oidc.Configuration,
+	db *gorm.DB,
+) *http.Request {
+	token, err := getToken(request)
+	if err != nil {
+		return request
+	}
+
+	tok, exists := oidcTokens[token]
+	if !exists {
+		return request
+	}
+
+	if !tok.Expiration().After(time.Now()) {
+		return request
+	}
+
+	var isAdmin bool
+	for _, key := range []string{"groups", "traggo_role"} {
+		if roleVar, ok := tok.GetField(key); ok {
+			switch roleVar := roleVar.(type) {
+			case string:
+				isAdmin = isAdmin || roleVar == "admin"
+			case []string:
+				isAdmin = isAdmin ||
+					slices.Contains(roleVar, "admin") ||
+					slices.Contains(roleVar, "traggoAdmin")
+			}
+		}
+	}
+
+	user := &model.User{
+		ID:    stringToInt(tok.Subject()),
+		Name:  tok.Name(),
+		Admin: isAdmin,
+	}
+	db.Save(user)
+
+	impersonate := request.Header.Get("X-Traggo-Impersonate")
+	if impersonate != "" {
+		if !user.Admin {
+			log.Info().Str("impersonate", impersonate).Msg("Trying to impersonate without being admin")
+			return request
+		}
+		userID, err := strconv.Atoi(impersonate)
+		if err != nil {
+			log.Info().Str("impersonate", impersonate).Msg("Unable to parse impersonation header")
+			return request
+		}
+		impersonateUser := &model.User{}
+		if db.Find(impersonateUser, userID).RecordNotFound() {
+			log.Info().Int("userid", userID).Msg("Impersonation user not found")
+			return request
+		}
+		user = impersonateUser
+		log.Info().Str("username", user.Name).Msg("Impersonation user")
+	}
+
+	return request.WithContext(WithUser(request.Context(), user))
+}
+
+func stringToInt(id string) int {
+	return int(crc64.Checksum([]byte(id), crc64.MakeTable(crc64.ECMA)))
 }
 
 func reqisterUser(request *http.Request, writer http.ResponseWriter, db *gorm.DB) *http.Request {
